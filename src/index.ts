@@ -6,6 +6,7 @@ import {
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
+  TELEGRAM_BOT_POOL,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
@@ -44,6 +45,7 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
+import { initBotPool } from './channels/telegram.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -204,8 +206,39 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   await channel.setTyping?.(chatJid, true);
+
+  // Typing indicator: start on activity, stop after each response
+  let typingInterval: ReturnType<typeof setInterval> | null = null;
+  const startTyping = () => {
+    if (typingInterval) return; // already running
+    channel.setTyping?.(chatJid, true)?.catch(() => {});
+    typingInterval = setInterval(() => {
+      channel.setTyping?.(chatJid, true)?.catch(() => {});
+    }, 4000);
+  };
+  const stopTyping = () => {
+    if (typingInterval) {
+      clearInterval(typingInterval);
+      typingInterval = null;
+    }
+  };
+  startTyping();
+
   let hadError = false;
   let outputSentToUser = false;
+
+  // Rate-limit progress messages (max one every 8 seconds)
+  let lastProgressSent = 0;
+  let lastOutputTime = 0;
+  const onProgress = (description: string) => {
+    const now = Date.now();
+    // Suppress for 5 seconds after output (avoids stale progress after answer)
+    if (lastOutputTime > 0 && now - lastOutputTime < 5000) return;
+    if (now - lastProgressSent < 8000) return;
+    lastProgressSent = now;
+    startTyping(); // Restart typing for this new turn
+    channel.sendMessage(chatJid, `_${description}_`).catch(() => {});
+  };
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -218,8 +251,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
+        stopTyping(); // Stop typing when response arrives
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
+        lastOutputTime = Date.now();
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -232,9 +267,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (result.status === 'error') {
       hadError = true;
     }
-  });
+  }, onProgress);
 
-  await channel.setTyping?.(chatJid, false);
+  stopTyping();
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -265,6 +300,7 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  onProgress?: (description: string) => void,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
@@ -319,6 +355,7 @@ async function runAgent(
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
+      onProgress,
     );
 
     if (output.newSessionId) {
@@ -540,6 +577,11 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Initialize Telegram bot pool for agent teams (swarm)
+  if (TELEGRAM_BOT_POOL.length > 0) {
+    await initBotPool(TELEGRAM_BOT_POOL);
+  }
+
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
@@ -562,6 +604,16 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
+    },
+    sendVoice: async (jid, text) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (typeof (channel as any).sendVoice === 'function') {
+        await (channel as any).sendVoice(jid, text);
+      } else {
+        logger.warn({ jid }, 'Channel does not support sendVoice, sending as text');
+        await channel.sendMessage(jid, text);
+      }
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

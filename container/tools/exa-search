@@ -1,0 +1,67 @@
+#!/bin/bash
+# exa-search — Semantic search via Exa API
+# Usage: exa-search "query" [num_results] [start_date] [category]
+# Examples:
+#   exa-search "What it's like to work at Anthropic"
+#   exa-search "Recent news about Cursor funding" 5 2025-09-01
+#   exa-search "VP Product at AI startups" 10 "" "company"
+
+set -euo pipefail
+
+QUERY="${1:?Usage: exa-search \"query\" [num_results] [start_date] [category]}"
+NUM_RESULTS="${2:-10}"
+START_DATE="${3:-}"
+CATEGORY="${4:-}"
+
+if [ -z "${EXA_API_KEY:-}" ]; then
+  echo "Error: EXA_API_KEY not set" >&2
+  exit 1
+fi
+
+# Build JSON payload
+PAYLOAD=$(cat <<EOF
+{
+  "query": $(printf '%s' "$QUERY" | jq -Rs .),
+  "numResults": $NUM_RESULTS,
+  "text": {"maxCharacters": 3000},
+  "useAutoprompt": true
+EOF
+)
+
+# Add optional fields
+if [ -n "$START_DATE" ]; then
+  PAYLOAD=$(echo "$PAYLOAD" | sed '$ s/$/,/')
+  PAYLOAD="$PAYLOAD
+  \"startPublishedDate\": \"${START_DATE}T00:00:00.000Z\""
+fi
+
+if [ -n "$CATEGORY" ]; then
+  PAYLOAD=$(echo "$PAYLOAD" | sed '$ s/$/,/')
+  PAYLOAD="$PAYLOAD
+  \"category\": \"$CATEGORY\""
+fi
+
+PAYLOAD="$PAYLOAD
+}"
+
+RESPONSE=$(curl -s -X POST "https://api.exa.ai/search" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $EXA_API_KEY" \
+  -d "$PAYLOAD")
+
+# Format output
+echo "$RESPONSE" | jq -r '
+  if .results then
+    (.results | length | tostring) + " results found:\n" +
+    (.results | to_entries | map(
+      "\n--- Result " + ((.key + 1) | tostring) + " ---\n" +
+      "Title: " + (.value.title // "N/A") + "\n" +
+      "URL: " + (.value.url // "N/A") + "\n" +
+      "Date: " + (.value.publishedDate // "N/A") + "\n" +
+      "Score: " + ((.value.score // 0) | tostring) + "\n" +
+      "Text: " + (.value.text // "N/A")[0:2000]
+    ) | join("\n"))
+  else
+    "Error: " + (. | tostring)
+  end
+' 2>/dev/null || echo "$RESPONSE"

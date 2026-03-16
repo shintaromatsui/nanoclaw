@@ -27,6 +27,7 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  model?: string;
 }
 
 interface ContainerOutput {
@@ -324,6 +325,44 @@ function waitForIpcMessage(): Promise<string | null> {
 }
 
 /**
+ * Determine which MCP servers are needed based on the prompt content.
+ * The nanoclaw IPC server is always included.
+ */
+function detectNeededMcpServers(prompt: string): Set<string> {
+  const ALL_SERVERS = ['nanoclaw', 'google_calendar', 'google_drive', 'notion', 'gmail'] as const;
+  const needed = new Set<string>(['nanoclaw']);
+  const lower = prompt.toLowerCase();
+
+  // Load all servers for complex multi-part tasks (overnight work, assignments,
+  // multi-step check-ins) — they may dynamically need any tool
+  if (/\b(overnight|assignment|two parts|three parts|multi|check-in)\b/.test(lower)) {
+    return new Set<string>(ALL_SERVERS);
+  }
+
+  // Google Calendar: calendar, schedule, event, meeting, "what's on", briefing
+  if (/\b(calendar|schedule|event|meeting|what'?s on|briefing|agenda|mcp__google_calendar)\b/.test(lower)) {
+    needed.add('google_calendar');
+  }
+
+  // Google Drive/Docs: drive, doc, document, sheet, spreadsheet
+  if (/\b(drive|google doc|document|sheet|spreadsheet|create.*file|save.*file|mcp__google_drive)\b/.test(lower)) {
+    needed.add('google_drive');
+  }
+
+  // Notion: notion
+  if (/\b(notion|mcp__notion)\b/.test(lower)) {
+    needed.add('notion');
+  }
+
+  // Gmail: email, gmail, mail, inbox, draft
+  if (/\b(email|gmail|e-mail|inbox|draft.*mail|mail.*draft|send.*mail|mcp__gmail)\b/.test(lower)) {
+    needed.add('gmail');
+  }
+
+  return needed;
+}
+
+/**
  * Run a single query and stream results via writeOutput.
  * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
  * allowing agent teams subagents to run to completion.
@@ -389,41 +428,113 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // Lazy MCP: only start servers the prompt actually needs
+  const neededServers = detectNeededMcpServers(prompt);
+  log(`MCP servers for this query: ${[...neededServers].join(', ')}`);
+
+  const mcpServers: Record<string, { command: string; args: string[]; env?: Record<string, string> }> = {
+    nanoclaw: {
+      command: 'node',
+      args: [mcpServerPath],
+      env: {
+        NANOCLAW_CHAT_JID: containerInput.chatJid,
+        NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+        NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+      },
+    },
+  };
+
+  if (neededServers.has('google_calendar')) {
+    mcpServers.google_calendar = {
+      command: 'node',
+      args: ['/app/node_modules/@gongrzhe/server-calendar-autoauth-mcp/build/index.js'],
+    };
+  }
+  if (neededServers.has('google_drive')) {
+    mcpServers.google_drive = {
+      command: 'node',
+      args: ['/app/node_modules/@piotr-agier/google-drive-mcp/dist/index.js'],
+    };
+  }
+  if (neededServers.has('notion')) {
+    mcpServers.notion = {
+      command: 'node',
+      args: ['/app/node_modules/@notionhq/notion-mcp-server/bin/cli.mjs'],
+      env: {
+        OPENAPI_MCP_HEADERS: JSON.stringify({
+          Authorization: `Bearer ${process.env.NOTION_API_KEY || ''}`,
+          'Notion-Version': '2022-06-28',
+        }),
+      },
+    };
+  }
+
+  // Build allowed tools list — only include MCP tool permissions for active servers
+  const allowedTools: string[] = [
+    'Bash',
+    'Read', 'Write', 'Edit', 'Glob', 'Grep',
+    'WebSearch', 'WebFetch',
+    'Task', 'TaskOutput', 'TaskStop',
+    'TeamCreate', 'TeamDelete', 'SendMessage',
+    'TodoWrite', 'ToolSearch', 'Skill',
+    'NotebookEdit',
+    'mcp__nanoclaw__*',
+  ];
+
+  if (neededServers.has('google_calendar')) {
+    // Calendar: view-only (no create/update/delete)
+    allowedTools.push('mcp__google_calendar__list_events', 'mcp__google_calendar__get_event');
+  }
+  if (neededServers.has('google_drive')) {
+    // Drive/Docs: all except delete operations
+    allowedTools.push(
+      'mcp__google_drive__downloadFile',
+      'mcp__google_drive__listCalendars',
+      'mcp__google_drive__getCalendarEvents',
+      'mcp__google_drive__getCalendarEvent',
+      'mcp__google_drive__insertText',
+      'mcp__google_drive__applyTextStyle',
+      'mcp__google_drive__applyParagraphStyle',
+      'mcp__google_drive__insertTable',
+      'mcp__google_drive__editTableCell',
+      'mcp__google_drive__insertImageFromUrl',
+      'mcp__google_drive__insertLocalImage',
+      'mcp__google_drive__addComment',
+      'mcp__google_drive__getComment',
+      'mcp__google_drive__listComments',
+      'mcp__google_drive__replyToComment',
+      'mcp__google_drive__formatGoogleSheetText',
+      'mcp__google_drive__formatGoogleSheetNumbers',
+      'mcp__google_drive__formatGoogleSheetCells',
+      'mcp__google_drive__setGoogleSheetBorders',
+      'mcp__google_drive__addGoogleSheetConditionalFormat',
+      'mcp__google_drive__mergeGoogleSheetCells',
+      'mcp__google_drive__appendSpreadsheetRows',
+      'mcp__google_drive__addSpreadsheetSheet',
+      'mcp__google_drive__getSpreadsheetInfo',
+    );
+  }
+  if (neededServers.has('notion')) {
+    allowedTools.push('mcp__notion__*');
+  }
+
   for await (const message of query({
     prompt: stream,
     options: {
       cwd: '/workspace/group',
+      model: containerInput.model,
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
       systemPrompt: globalClaudeMd
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
         : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*'
-      ],
+      allowedTools,
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-          },
-        },
-      },
+      mcpServers,
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
       },
@@ -435,6 +546,17 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+
+      // Emit progress for tool_use blocks so host can show status to user
+      const betaMsg = (message as any).message;
+      if (betaMsg?.content && Array.isArray(betaMsg.content)) {
+        const toolNames = betaMsg.content
+          .filter((b: any) => b.type === 'tool_use' && b.name)
+          .map((b: any) => b.name as string);
+        if (toolNames.length > 0) {
+          log(`[progress] ${toolNames.join(',')}`);
+        }
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {

@@ -4,6 +4,7 @@
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -41,6 +42,7 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  model?: string;
 }
 
 export interface ContainerOutput {
@@ -147,6 +149,8 @@ function buildVolumeMounts(
   }
 
   // Sync skills from container/skills/ into each group's .claude/skills/
+  // Only copy files that are missing or older than the source, so agent
+  // modifications to skills persist across container restarts.
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
   if (fs.existsSync(skillsSrc)) {
@@ -154,7 +158,18 @@ function buildVolumeMounts(
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
       const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
+      fs.mkdirSync(dstDir, { recursive: true });
+      for (const file of fs.readdirSync(srcDir)) {
+        const srcFile = path.join(srcDir, file);
+        const dstFile = path.join(dstDir, file);
+        if (!fs.statSync(srcFile).isFile()) continue;
+        if (fs.existsSync(dstFile)) {
+          const srcMtime = fs.statSync(srcFile).mtimeMs;
+          const dstMtime = fs.statSync(dstFile).mtimeMs;
+          if (srcMtime <= dstMtime) continue;
+        }
+        fs.copyFileSync(srcFile, dstFile);
+      }
     }
   }
   mounts.push({
@@ -199,6 +214,33 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Google Calendar MCP credentials (~/.calendar-mcp/)
+  const calendarMcpDir = path.join(
+    process.env.HOME || os.homedir(),
+    '.calendar-mcp',
+  );
+  if (fs.existsSync(calendarMcpDir)) {
+    mounts.push({
+      hostPath: calendarMcpDir,
+      containerPath: '/home/node/.calendar-mcp',
+      readonly: false,
+    });
+  }
+
+  // Google Drive MCP credentials (~/.config/google-drive-mcp/)
+  const driveMcpDir = path.join(
+    process.env.HOME || os.homedir(),
+    '.config',
+    'google-drive-mcp',
+  );
+  if (fs.existsSync(driveMcpDir)) {
+    mounts.push({
+      hostPath: driveMcpDir,
+      containerPath: '/home/node/.config/google-drive-mcp',
+      readonly: false,
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -238,6 +280,21 @@ function buildContainerArgs(
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
   }
 
+  // Pass through third-party API keys from host environment
+  const passthroughEnvVars = [
+    'EXA_API_KEY',
+    'FIRECRAWL_API_KEY',
+    'NOTION_API_KEY',
+    'TWITTER_API_IO_KEY',
+    'APIFY_API_KEY',
+  ];
+  for (const envVar of passthroughEnvVars) {
+    const value = process.env[envVar];
+    if (value) {
+      args.push('-e', `${envVar}=${value}`);
+    }
+  }
+
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
 
@@ -264,11 +321,36 @@ function buildContainerArgs(
   return args;
 }
 
+/**
+ * Map tool names from the SDK to user-friendly progress descriptions.
+ */
+function describeToolProgress(toolNames: string[]): string | null {
+  const descriptions: string[] = [];
+  for (const name of toolNames) {
+    if (name === 'WebSearch' || name === 'WebFetch') descriptions.push('Searching the web');
+    else if (name === 'Bash') descriptions.push('Running a command');
+    else if (name === 'Read') descriptions.push('Reading files');
+    else if (name === 'Edit' || name === 'Write') descriptions.push('Writing');
+    else if (name === 'Glob' || name === 'Grep') descriptions.push('Searching codebase');
+    else if (name.startsWith('mcp__google_calendar')) descriptions.push('Checking calendar');
+    else if (name.startsWith('mcp__google_drive')) descriptions.push('Accessing Drive');
+    else if (name.startsWith('mcp__notion')) descriptions.push('Checking Notion');
+    else if (name.startsWith('mcp__gmail')) descriptions.push('Checking email');
+    else if (name.startsWith('mcp__nanoclaw')) descriptions.push('Processing');
+    else if (name === 'TeamCreate' || name === 'Task') descriptions.push('Starting team');
+    // Skip fast/internal tools: Glob, Grep, ToolSearch, etc.
+  }
+  // Deduplicate
+  const unique = [...new Set(descriptions)];
+  return unique.length > 0 ? unique.join(', ') + '...' : null;
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  onProgress?: (description: string) => void,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
@@ -383,6 +465,19 @@ export async function runContainerAgent(
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
         if (line) logger.debug({ container: group.folder }, line);
+
+        // Detect progress markers from agent-runner and forward to caller
+        if (line.includes('[progress]')) {
+          const match = line.match(/\[progress\]\s*(.+)/);
+          if (match) {
+            const toolNames = match[1].split(',').map((s: string) => s.trim());
+            const desc = describeToolProgress(toolNames);
+            if (desc && onProgress) {
+              logger.info({ container: group.folder, desc }, 'Sending progress');
+              onProgress(desc);
+            }
+          }
+        }
       }
       // Don't reset timeout on stderr — SDK writes debug logs continuously.
       // Timeout only resets on actual output (OUTPUT_MARKER in stdout).

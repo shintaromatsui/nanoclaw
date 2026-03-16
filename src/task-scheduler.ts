@@ -75,6 +75,34 @@ export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
+/**
+ * Determine the model to use for a scheduled task based on its prompt.
+ * - Haiku: lightweight tasks (heartbeat, nudges, wind-down)
+ * - Sonnet: heavier tasks (briefings, synthesis, research, multi-part check-ins)
+ * - undefined: user messages use the default model (opus)
+ */
+function selectModelForTask(prompt: string): string | undefined {
+  const lower = prompt.toLowerCase();
+
+  // Sonnet-tier: complex tasks that read multiple sources or do research
+  const sonnetPatterns = [
+    /briefing/,
+    /synthesis/,
+    /overnight/,
+    /research/,
+    /sunday.*check-in/,
+    /three parts/,
+    /two parts/,
+    /multi/,
+  ];
+  if (sonnetPatterns.some((p) => p.test(lower))) {
+    return 'claude-sonnet-4-6';
+  }
+
+  // Everything else (heartbeat, nudges, wind-down) → Haiku
+  return 'claude-haiku-4-5-20251001';
+}
+
 async function runTask(
   task: ScheduledTask,
   deps: SchedulerDependencies,
@@ -169,6 +197,12 @@ async function runTask(
   };
 
   try {
+    const taskModel = selectModelForTask(task.prompt);
+    logger.debug(
+      { taskId: task.id, model: taskModel || 'default' },
+      'Selected model for task',
+    );
+
     const output = await runContainerAgent(
       group,
       {
@@ -179,6 +213,7 @@ async function runTask(
         isMain,
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
+        model: taskModel,
       },
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),

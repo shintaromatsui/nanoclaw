@@ -1,0 +1,35 @@
+#!/bin/bash
+# firecrawl-scrape — Extract clean content from a URL via Firecrawl API
+# Usage: firecrawl-scrape "url"
+# Examples:
+#   firecrawl-scrape "https://example.com/blog/post"
+#   firecrawl-scrape "https://techcrunch.com/2026/01/15/company-raises-100m"
+
+set -euo pipefail
+
+URL="${1:?Usage: firecrawl-scrape \"url\"}"
+
+if [ -z "${FIRECRAWL_API_KEY:-}" ]; then
+  echo "Error: FIRECRAWL_API_KEY not set" >&2
+  exit 1
+fi
+
+RESPONSE=$(curl -s -X POST "https://api.firecrawl.dev/v1/scrape" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $FIRECRAWL_API_KEY" \
+  -d "{\"url\": $(printf '%s' "$URL" | jq -Rs .), \"formats\": [\"markdown\"]}")
+
+# Format output
+echo "$RESPONSE" | jq -r '
+  if .success == true then
+    "Title: " + (.data.metadata.title // "N/A") + "\n" +
+    "URL: " + (.data.metadata.url // "N/A") + "\n" +
+    "Description: " + (.data.metadata.description // "N/A") + "\n" +
+    "---\n" +
+    (.data.markdown // "No content extracted")
+  elif .error then
+    "Error: " + .error
+  else
+    "Error: " + (. | tostring)
+  end
+' 2>/dev/null || echo "$RESPONSE"

@@ -1,8 +1,14 @@
+import { execFile } from 'child_process';
+import fs from 'fs';
 import https from 'https';
-import { Api, Bot } from 'grammy';
+import path from 'path';
+import { promisify } from 'util';
+
+import { Api, Bot, InputFile } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
+import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
@@ -11,6 +17,92 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+const execFileAsync = promisify(execFile);
+
+// Bot pool for agent teams: send-only Api instances (no polling)
+const poolApis: Api[] = [];
+// Maps "{groupFolder}:{senderName}" → pool Api index for stable assignment
+const senderBotMap = new Map<string, number>();
+let nextPoolIndex = 0;
+
+/**
+ * Initialize send-only Api instances for the bot pool.
+ * Each pool bot can send messages but doesn't poll for updates.
+ */
+export async function initBotPool(tokens: string[]): Promise<void> {
+  for (const token of tokens) {
+    try {
+      const api = new Api(token);
+      const me = await api.getMe();
+      poolApis.push(api);
+      logger.info(
+        { username: me.username, id: me.id, poolSize: poolApis.length },
+        'Pool bot initialized',
+      );
+    } catch (err) {
+      logger.error({ err }, 'Failed to initialize pool bot');
+    }
+  }
+  if (poolApis.length > 0) {
+    logger.info({ count: poolApis.length }, 'Telegram bot pool ready');
+  }
+}
+
+/**
+ * Send a message via a pool bot assigned to the given sender name.
+ * Assigns bots round-robin on first use; subsequent messages from the
+ * same sender in the same group always use the same bot.
+ */
+export async function sendPoolMessage(
+  chatId: string,
+  text: string,
+  sender: string,
+  groupFolder: string,
+): Promise<void> {
+  if (poolApis.length === 0) {
+    // No pool bots — fall back to main bot send via channel
+    return;
+  }
+
+  const key = `${groupFolder}:${sender}`;
+  let idx = senderBotMap.get(key);
+  if (idx === undefined) {
+    idx = nextPoolIndex % poolApis.length;
+    nextPoolIndex++;
+    senderBotMap.set(key, idx);
+    // Rename the bot to match the sender's role
+    try {
+      await poolApis[idx].setMyName(sender);
+      await new Promise((r) => setTimeout(r, 2000));
+      logger.info(
+        { sender, groupFolder, poolIndex: idx },
+        'Assigned and renamed pool bot',
+      );
+    } catch (err) {
+      logger.warn({ sender, err }, 'Failed to rename pool bot (sending anyway)');
+    }
+  }
+
+  const api = poolApis[idx];
+  try {
+    const numericId = chatId.replace(/^tg:/, '');
+    const MAX_LENGTH = 4096;
+    if (text.length <= MAX_LENGTH) {
+      await sendTelegramMessage(api, numericId, text);
+    } else {
+      for (let i = 0; i < text.length; i += MAX_LENGTH) {
+        await sendTelegramMessage(api, numericId, text.slice(i, i + MAX_LENGTH));
+      }
+    }
+    logger.info(
+      { chatId, sender, poolIndex: idx, length: text.length },
+      'Pool message sent',
+    );
+  } catch (err) {
+    logger.error({ chatId, sender, err }, 'Failed to send pool message');
+  }
+}
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -51,6 +143,73 @@ export class TelegramChannel implements Channel {
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
     this.opts = opts;
+  }
+
+  /**
+   * Download a file from Telegram and save it to the group's media directory.
+   * Returns the host filesystem path, or null on failure.
+   */
+  private async downloadFile(
+    fileId: string,
+    groupFolder: string,
+    filename: string,
+  ): Promise<string | null> {
+    try {
+      const file = await this.bot!.api.getFile(fileId);
+      if (!file.file_path) return null;
+
+      const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+      const groupDir = resolveGroupFolderPath(groupFolder);
+      const mediaDir = path.join(groupDir, 'media');
+      fs.mkdirSync(mediaDir, { recursive: true });
+
+      const destPath = path.join(mediaDir, filename);
+
+      await new Promise<void>((resolve, reject) => {
+        const outStream = fs.createWriteStream(destPath);
+        https.get(url, (res) => {
+          res.pipe(outStream);
+          outStream.on('finish', () => { outStream.close(); resolve(); });
+        }).on('error', reject);
+      });
+
+      logger.info({ fileId, destPath }, 'Downloaded Telegram file');
+      return destPath;
+    } catch (err) {
+      logger.error({ fileId, err }, 'Failed to download Telegram file');
+      return null;
+    }
+  }
+
+  /**
+   * Transcribe a voice note using whisper-cli on the host.
+   * Converts .oga → .wav via ffmpeg, then runs whisper-cli.
+   */
+  private async transcribeVoice(filePath: string): Promise<string | null> {
+    try {
+      const wavPath = filePath.replace(/\.[^.]+$/, '.wav');
+      await execFileAsync('/opt/homebrew/bin/ffmpeg', [
+        '-i', filePath, '-ar', '16000', '-ac', '1', '-y', wavPath,
+      ], { timeout: 30000 });
+
+      const modelPath = path.join(
+        process.env.HOME || '/Users/agent',
+        '.local/share/whisper-cpp/ggml-base.en.bin',
+      );
+      const { stdout } = await execFileAsync('/opt/homebrew/bin/whisper-cli', [
+        '-m', modelPath, '-f', wavPath, '--no-timestamps', '-np',
+      ], { timeout: 60000 });
+
+      // Clean up wav file
+      try { fs.unlinkSync(wavPath); } catch { /* ignore */ }
+
+      const text = stdout.trim();
+      logger.info({ filePath, transcriptLength: text.length }, 'Voice transcribed');
+      return text || null;
+    } catch (err) {
+      logger.error({ filePath, err }, 'Voice transcription failed');
+      return null;
+    }
   }
 
   async connect(): Promise<void> {
@@ -193,14 +352,70 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
-    this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
-    this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
-    this.bot.on('message:document', (ctx) => {
-      const name = ctx.message.document?.file_name || 'file';
-      storeNonText(ctx, `[Document: ${name}]`);
+    // Media handlers — download files and pass paths/transcripts to the agent
+    this.bot.on('message:photo', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const photos = ctx.message.photo;
+      const largest = photos[photos.length - 1];
+      const msgId = ctx.message.message_id;
+      const filename = `img_${msgId}.jpg`;
+
+      const hostPath = await this.downloadFile(largest.file_id, group.folder, filename);
+      if (hostPath) {
+        const containerPath = `/workspace/group/media/${filename}`;
+        const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+        storeNonText(ctx, `[Image: ${containerPath}]${caption}`);
+      } else {
+        storeNonText(ctx, '[Photo]');
+      }
     });
+
+    this.bot.on('message:voice', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const msgId = ctx.message.message_id;
+      const filename = `voice_${msgId}.oga`;
+
+      const hostPath = await this.downloadFile(ctx.message.voice.file_id, group.folder, filename);
+      if (hostPath) {
+        const transcript = await this.transcribeVoice(hostPath);
+        if (transcript) {
+          storeNonText(ctx, `[Voice transcript] ${transcript}`);
+        } else {
+          const containerPath = `/workspace/group/media/${filename}`;
+          storeNonText(ctx, `[Voice message: ${containerPath}]`);
+        }
+      } else {
+        storeNonText(ctx, '[Voice message]');
+      }
+    });
+
+    this.bot.on('message:document', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const docName = ctx.message.document?.file_name || 'file';
+      const msgId = ctx.message.message_id;
+      const filename = `doc_${msgId}_${docName}`;
+
+      const hostPath = await this.downloadFile(ctx.message.document.file_id, group.folder, filename);
+      if (hostPath) {
+        const containerPath = `/workspace/group/media/${filename}`;
+        const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+        storeNonText(ctx, `[Document: ${containerPath}]${caption}`);
+      } else {
+        storeNonText(ctx, `[Document: ${docName}]`);
+      }
+    });
+
+    this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
+    this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
     this.bot.on('message:sticker', (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';
       storeNonText(ctx, `[Sticker ${emoji}]`);
@@ -272,6 +487,61 @@ export class TelegramChannel implements Channel {
       this.bot.stop();
       this.bot = null;
       logger.info('Telegram bot stopped');
+    }
+  }
+
+  /**
+   * Synthesize text to speech via ElevenLabs and send as a Telegram voice message.
+   */
+  async sendVoice(jid: string, text: string): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+
+    const apiKey = process.env.ELEVENLABS_API_KEY || readEnvFile(['ELEVENLABS_API_KEY']).ELEVENLABS_API_KEY;
+    if (!apiKey) {
+      logger.error('ELEVENLABS_API_KEY not set, cannot send voice');
+      return;
+    }
+
+    const voiceId = 'lUTamkMw7gOzZbFIwmq4';
+    const numericId = jid.replace(/^tg:/, '');
+    const ts = Date.now();
+    const mp3Path = `/tmp/nanoclaw-voice-${ts}.mp3`;
+
+    try {
+      // ElevenLabs TTS API → mp3
+      const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+        method: 'POST',
+        headers: {
+          'xi-api-key': apiKey,
+          'Content-Type': 'application/json',
+          'Accept': 'audio/mpeg',
+        },
+        body: JSON.stringify({
+          text,
+          model_id: 'eleven_turbo_v2_5',
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+        }),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`ElevenLabs API ${res.status}: ${errText}`);
+      }
+
+      // Write mp3 to disk
+      const buffer = Buffer.from(await res.arrayBuffer());
+      fs.writeFileSync(mp3Path, buffer);
+
+      // Send via Telegram (sendVoice accepts mp3)
+      await this.bot.api.sendVoice(numericId, new InputFile(fs.createReadStream(mp3Path)));
+      logger.info({ jid, textLength: text.length }, 'Voice message sent');
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send voice message');
+    } finally {
+      try { fs.unlinkSync(mp3Path); } catch { /* ignore */ }
     }
   }
 
